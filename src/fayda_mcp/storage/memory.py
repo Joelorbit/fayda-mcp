@@ -68,7 +68,14 @@ class MemoryResultRepository:
             principal_id = req_copy.get("principal_id")
             idempotency_key = req_copy.get("idempotency_key")
             if tenant_id and principal_id and idempotency_key:
-                self._idempotency_index[(str(tenant_id), str(principal_id), str(idempotency_key))] = request_id
+                key = (str(tenant_id), str(principal_id), str(idempotency_key))
+                existing_request_id = self._idempotency_index.get(key)
+                if existing_request_id and existing_request_id != request_id:
+                    # Preserve the first durable winner when concurrent starts
+                    # race each other. The service resolves it after this call.
+                    self._requests.pop(request_id, None)
+                    return
+                self._idempotency_index[key] = request_id
 
     async def get_request(self, request_id: str) -> Optional[Dict[str, Any]]:
         async with self._lock:

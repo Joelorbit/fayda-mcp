@@ -169,6 +169,22 @@ class FaydaVerificationService:
         }
         await self.results.save_request(request_id, request_record, ttl_seconds=self.config.result_ttl_seconds)
 
+        # A durable store may enforce the idempotency uniqueness constraint
+        # atomically while another request is racing this one. Resolve the
+        # winner before returning so callers never receive an unpersisted ID.
+        stored = await self.results.find_by_idempotency_key(
+            tenant_id=context.tenant_id,
+            principal_id=context.principal_id,
+            idempotency_key=idempotency_key,
+        )
+        if stored and stored.get("request_id") != request_id:
+            await self.sessions.delete_session(state)
+            return StartVerificationResponse(
+                request_id=stored["request_id"],
+                authorization_url=stored.get("authorization_url", ""),
+                expires_at=stored["expires_at"],
+            )
+
         if self.audit:
             await self.audit.record_event(
                 "verification_started",

@@ -247,3 +247,103 @@ async def test_service_idempotent_start_verification():
     assert first.request_id == second.request_id
     assert first.authorization_url == second.authorization_url
     assert first.expires_at == second.expires_at
+
+
+from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime, timezone
+
+try:
+    from fayda_mcp.storage.postgres import PostgresResultRepository
+except ImportError:
+    PostgresResultRepository = None
+
+
+@pytest.mark.skipif(PostgresResultRepository is None, reason="Postgres extra not available")
+class TestPostgresResultRepositoryUnit:
+    """Unit tests for PostgresResultRepository contract adherence and query logic."""
+
+    def test_protocol_conformance(self):
+        mock_factory = MagicMock()
+        repo = PostgresResultRepository(session_factory=mock_factory)
+        assert isinstance(repo, ResultRepository)
+
+    def test_requires_session_factory(self):
+        with pytest.raises(ValueError, match="session_factory is required"):
+            PostgresResultRepository(session_factory=None)
+
+    def test_validates_table_prefix(self):
+        mock_factory = MagicMock()
+        with pytest.raises(ValueError, match="table_prefix must contain only"):
+            PostgresResultRepository(session_factory=mock_factory, table_prefix="bad;--drop")
+
+        repo = PostgresResultRepository(session_factory=mock_factory, table_prefix="custom_")
+        assert repo.requests_table == "custom_requests"
+        assert repo.results_table == "custom_results"
+
+    def test_expiry_parsing(self):
+        dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        assert PostgresResultRepository._expiry(dt, 900) == dt
+
+        iso_str = "2026-01-01T12:00:00Z"
+        assert PostgresResultRepository._expiry(iso_str, 900) == dt
+
+        now_res = PostgresResultRepository._expiry(None, 60)
+        assert now_res.tzinfo == timezone.utc
+
+    def test_json_serialization_and_parsing(self):
+        data = {"key": "val", "num": 123}
+        serialized = PostgresResultRepository._json(data)
+        assert PostgresResultRepository._parse_json(serialized) == data
+
+        res = VerificationResult(
+            request_id="vr_test",
+            status="verified",
+            checks={"identity_verified": True},
+            verified_at="2026-01-01T12:00:00Z",
+        )
+        serialized_res = PostgresResultRepository._json(res)
+        parsed = PostgresResultRepository._parse_json(serialized_res)
+        assert parsed["status"] == "verified"
+        assert parsed["checks"]["identity_verified"] is True
+
+    @pytest.mark.asyncio
+    async def test_create_schema_issues_ddl(self):
+        class MockAsyncCtx:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return None
+
+        mock_session = AsyncMock()
+        mock_session.begin = MagicMock(return_value=MockAsyncCtx())
+        mock_factory = MagicMock()
+        mock_factory.return_value.__aenter__.return_value = mock_session
+        mock_factory.return_value.__aexit__.return_value = None
+
+        repo = PostgresResultRepository(session_factory=mock_factory, table_prefix="test_")
+        await repo.create_schema()
+
+        assert mock_session.execute.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_finalize_result_terminal_rejection(self):
+        class MockAsyncCtx:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                return None
+
+        mock_session = AsyncMock()
+        mock_session.begin = MagicMock(return_value=MockAsyncCtx())
+        mock_result = MagicMock()
+        mock_result.mappings.return_value.first.return_value = {"status": "verified"}
+        mock_session.execute.return_value = mock_result
+        mock_factory = MagicMock()
+        mock_factory.return_value.__aenter__.return_value = mock_session
+        mock_factory.return_value.__aexit__.return_value = None
+
+        repo = PostgresResultRepository(session_factory=mock_factory)
+        result = VerificationResult(request_id="vr_1", status="verified")
+
+        outcome = await repo.finalize_result("vr_1", result)
+        assert outcome is False
